@@ -70,7 +70,11 @@ class KnownUnitInput(ApiModel):
 
 class FormulaInput(ApiModel):
     formula_no: Optional[Union[str, int]] = Field(
-        None, description="可选编号；已存在时表示更正，例如 F-001 或 1"
+        None,
+        description=(
+            "业务编号，建议使用 F-001 形式；带 F- 前缀时只按业务编号匹配，"
+            "绝不回退到内部行 ID。纯数字保留兼容：先匹配业务编号，再匹配内部 ID"
+        ),
     )
     expression: Optional[str] = Field(
         None,
@@ -125,7 +129,9 @@ class FormulaInput(ApiModel):
         )
         if prefix and prefix.group(1):
             if self.formula_no is None:
-                self.formula_no = int(prefix.group(1))
+                # Keep the F- business prefix so the service treats this as a
+                # business number, never as a bare internal id.
+                self.formula_no = f"F-{int(prefix.group(1)):03d}"
             text = text[prefix.end() :]
 
         if "=" not in text and "＝" not in text:

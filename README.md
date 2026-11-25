@@ -127,6 +127,47 @@ DELETE /formulas/{formula_no}
 
 撤回已撤回对象按幂等成功处理；撤回不存在的编号返回 `404` 且不改变目录。
 
+### 公式编号语义（F- 前缀 vs 纯数字）
+
+历史版本把 `F-001` 解析成数字 `1` 后还会回退匹配公式表内部主键，导致目录里已有内部 ID 为 1 的 `F-100` 时，登记 `F-001` 直接覆盖 `F-100`，撤回 `F-001` 也撤到了 `F-100`。现规则为：
+
+- **带 `F-` 前缀的编号只认业务编号**（`formulas.formula_no`），绝不回退到内部行 ID。`F-001`、`f1`、`#F-001` 都表示业务号 1；查不到就是不存在，登记会新建一行，撤回返回 `404 找不到`。
+- **纯数字引用保持旧行为不变**：先按业务编号匹配，匹配不到再按内部行 ID 匹配，保证既有数字调用方不受影响。
+- 撤回不存在的公式时返回 `404`，回执文案为“找不到公式编号 … 对应的公式”，目录保持不变。
+- 表达式字符串里的 `F-001:` 前缀同样按业务编号处理。
+
+## 3b. 旧 SQLite 卷串号修复
+
+旧卷若已发生上述串号（例如 `F-001` 的登记/更正/撤回全部落到内部 ID 为 1 的 `F-100` 上，且从未生成 `F-001` 行），可按**误登记批次 ID** 一次性修复这对公式：
+
+```http
+POST /repair/formula-swap/B-xxxxxxxxxxxxxxxx
+```
+
+也可在容器外对同一数据卷执行 CLI：
+
+```bash
+# 列出历史批次及修复台账
+docker compose run --rm repair --list
+# 按误登记批次修复
+docker compose run --rm repair --batch B-xxxxxxxxxxxxxxxx
+# 非 Docker 环境
+DATABASE_URL=sqlite:////data/catalog.db python3 -I scripts/repair_formula_swap.py --batch B-xxxxxxxxxxxxxxxx
+```
+
+修复规则：
+
+1. 只需误登记批次 ID；从该批次保存的**原请求和回执**中识别出“请求里的 F- 业务编号在回执里落到了别的业务号”，得到被覆盖的业务号（如 `F-100`）和应补建的业务号（如 `F-001`）。
+2. 只读取与这两个编号有关的批次请求和回执（误登记批次、更早触碰被覆盖编号的批次、之后显式引用这两个 F- 编号的批次）；其他批次不读。
+3. 用原请求和回执按时间线重放两条公式的登记、更正、撤回，把后续更正/撤回归到各自编号。回执保存的是字段内部 ID，因此**字段改名后仍按原字段 ID 恢复**。
+4. 相关操作都必须写明 F- 编号；公式必须用 `result/left/operator/right` 结构化字段提交。撤回若用有歧义的纯数字、或缺少结构化字段/回执，返回 `422 材料不足` 且目录不变；写入失败返回 `500` 并回滚。
+5. 只重算这对公式影响的连通组，候选单位投影（`field_effective`）和入仓清单（`warehouse_entries`）在同一事务内一起生效；其他连通组版本号不变。
+6. 历史批次的请求和回执原样保留，`GET /batches/{batch_id}` 仍可查询；修复本身另存一个 `REPAIR-*` 批次和 `formula_repairs` 台账行。
+7. 修复幂等：同一误登记批次再次调用直接返回台账（`status=already_repaired`），不重算、不覆盖修复之后发生的更正。
+
+`formula_repairs` 表在应用启动时由 `create_all` 自动补建，旧卷数据不删除、不迁移覆盖。
+
+
 ## 4. 查询与入仓清单
 
 常用接口（均有根路径、`/api`、`/api/v1`、`/api/v1/catalog` 前缀）：
@@ -221,15 +262,16 @@ F-001: c = a × b
 
 ```text
 app/
-  main.py        # FastAPI 路由、/docs、启动时投影修复
+  main.py        # FastAPI 路由、/docs、启动时投影修复、串号修复接口
   schemas.py     # 请求模型、别名、表达式解析
-  service.py     # 批次事务、连通组定位、局部重算、有效投影查询
+  service.py     # 批次事务、连通组定位、局部重算、F- 编号语义、串号修复、有效投影查询
   reasoning.py   # 单位约束传播、精确候选求解、冲突核心
   units.py       # 五种单位、别名、量纲和运算符
-  models.py      # SQLite ORM 表
+  models.py      # SQLite ORM 表（含 formula_repairs 修复台账）
   database.py    # engine/session/SQLite PRAGMA
-tests/           # API 测试和随机穷举对照测试
+tests/           # API 测试、编号身份测试、串号修复测试和随机穷举对照测试
 scripts/selftest.py
+scripts/repair_formula_swap.py   # 旧卷串号修复 CLI
 Dockerfile
 docker-compose.yml
 ```
@@ -240,6 +282,7 @@ docker-compose.yml
 - `known_units`：已知单位证据，保留编号、版本、生效/撤回状态；
 - `formulas`：整数编号 `formula_no` 与展示编号 `F-001`，保留版本和撤回状态；
 - `batches`：批次请求与核算结果；
+- `formula_repairs`：串号修复台账（误登记批次 ID、修复批次 ID、两个业务号），保证重复修复幂等；
 - `reasoning_groups`：连通组状态和冲突核心；
 - `field_effective`：查询直接读取的候选单位投影；
 - `warehouse_entries`：查询直接读取的入仓清单投影。
@@ -249,8 +292,8 @@ docker-compose.yml
 在交付环境中实际执行：
 
 ```bash
-PYTHONPATH=/tmp/pylibs:/workspace python3 -m pytest /workspace/tests -q
-# 8 passed
+python3 -m pytest tests -q
+# 26 passed
 ```
 
 测试覆盖：
@@ -262,7 +305,9 @@ PYTHONPATH=/tmp/pylibs:/workspace python3 -m pytest /workspace/tests -q
 - 撤回公式后候选恢复为五个单位；
 - 更正公式时只重算受影响连通组，其他组版本号不变；
 - 非法撤回的原子性；
-- `/health` 与 `/docs`。
+- `/health` 与 `/docs`；
+- F- 业务编号身份：`F-001` 不覆盖内部 ID 为 1 的 `F-100`、撤回各归各位、查不到报 `404 找不到`、纯数字引用保持内部 ID 兼容、表达式前缀按业务编号处理；
+- 旧卷串号修复：用原请求/回执恢复两条公式、撤回状态与版本还原、字段改名后按原字段 ID 恢复、只重算该连通组、入仓清单与候选同事务生效、历史回执原样可查、重复修复幂等且不覆盖后续更正、材料不足/无串号/歧义撤回时整体回滚。
 
 可读自测脚本也已实际通过：
 
@@ -277,15 +322,22 @@ PYTHONPATH=. python3 scripts/selftest.py
 还实际启动过 Uvicorn 并验证：
 
 ```text
-GET /health       -> {"status":"ok"}
-GET /docs         -> Swagger UI 页面
-GET /openapi.json -> 正常生成路径
-POST /batches     -> 字符串循环公式可解析并正确推断
+GET  /health                              -> {"status":"ok"}
+GET  /docs                                -> Swagger UI 页面
+GET  /openapi.json                        -> 正常生成路径（含修复接口与 404/422/500 响应）
+POST /batches                             -> 字符串循环公式可解析并正确推断
+POST /formulas (F-001 与 F-100 并存)       -> 两行独立，互不覆盖
+POST /formulas/F-001/withdraw             -> 只撤回 F-001；F-999 返回 404 找不到
+POST /repair/formula-swap/{误登记批次}     -> 两条公式归位、入仓清单恢复、重复调用幂等
 ```
+
+并手工构造了缺少 `formula_repairs` 表的旧版 SQLite 卷，确认应用启动时自动补建新表、旧数据完整保留。
+
 
 ## 9. 余项与限制
 
-- 当前交付沙箱中没有 `docker` / `docker compose` 可执行文件，因此未能在这里实际执行 `docker compose build/up`；已校验 `docker-compose.yml` 的 YAML 语法、Dockerfile 启动命令和应用本身的 Uvicorn/HTTP 行为。目标机器具备 Docker Compose v2 时可直接 `docker compose up --build`。
+- 当前交付沙箱中没有 `docker` / `docker compose` 可执行文件和守护进程，因此未能在这里实际执行 `docker compose build/up`；已校验 `docker-compose.yml` 的 YAML 语法（含 `repair` profile 服务）、Dockerfile 的 `COPY scripts` 与启动命令，并在同版本依赖下用 Uvicorn 完成全部 HTTP 端到端验证。目标机器具备 Docker Compose v2 时可直接 `docker compose up --build -d`，修复用 `docker compose run --rm repair --batch <误登记批次 ID>`。
 - 冲突核心是删除序下的极小不可满足集合，不保证是所有可能核心中证据条数最少的一个；接口返回的集合一定不能同时成立。
 - 求解器对每个字段的每个候选单位执行一次可行性搜索，并在组内使用 GAC + MRV 回溯。普通报表公式规模足够；若单个连通组包含大量高度耦合公式，后续可再加入量纲线性方程消元或增量传播来降低搜索量。连通组之间始终隔离，更正不会重算全库。
+- 串号修复依赖历史批次完整保存的结构化公式请求与回执（本系统所有 `/batches` 写入都会留存）。若旧卷中相关批次只有自由文本表达式、缺少回执或撤回未写明 F- 编号，修复会返回 `422 材料不足` 并保持目录不变，需要人工补证后再修复。
 - 当前没有做用户鉴权；这是内网入仓前目录服务，如需跨团队暴露应放在鉴权网关后或补充认证。

@@ -177,6 +177,7 @@ def update_known_unit(
 @router.post(
     "/known-units/{evidence_no}/withdraw",
     summary="撤回已知单位；不确定性会同步移出入仓清单",
+    responses={404: {"description": "找不到该编号对应的已知单位，目录不变"}},
 )
 def withdraw_known_unit(
     evidence_no: str, db: Session = Depends(get_db)
@@ -218,7 +219,11 @@ def update_formula(
     return with_effect(result["applied"]["formulas"][0], result)
 
 
-@router.post("/formulas/{formula_no}/withdraw", summary="撤回公式并重算受影响连通组")
+@router.post(
+    "/formulas/{formula_no}/withdraw",
+    summary="撤回公式并重算受影响连通组",
+    responses={404: {"description": "找不到该 F- 编号对应的公式，目录不变"}},
+)
 def withdraw_formula(formula_no: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
     result = service(db).apply_batch(schemas.BatchRequest(withdraw_formulas=[formula_no]))
     return with_effect(result["withdrawn"]["formulas"][0], result)
@@ -343,6 +348,34 @@ def get_batch(batch_id: str, db: Session = Depends(get_db)) -> Dict[str, Any]:
         "batch_no": batch.batch_no,
         "status": batch.status,
     }
+
+
+@router.post(
+    "/repair/formula-swap/{mistaken_batch_id}",
+    summary="按误登记批次 ID 用原请求和回执修复一对串号 F- 公式",
+    responses={
+        404: {"description": "误登记批次不存在"},
+        422: {"description": "未发现串号或材料不足（缺结构化公式/回执、撤回未写 F- 编号），目录不变"},
+        500: {"description": "写入失败，事务已回滚，目录不变"},
+    },
+)
+def repair_formula_swap(
+    mistaken_batch_id: str, db: Session = Depends(get_db)
+) -> Dict[str, Any]:
+    """旧 SQLite 卷串号修复：恢复两条公式并只重算其影响的连通组。
+
+    - 仅需误登记批次 ID，修复所需证据全部来自该批次及相关批次的原请求/回执；
+    - 重复修复返回已有台账，不覆盖后来的更正；
+    - 材料不足或写入失败时整体回滚，目录保持不变。
+    """
+    try:
+        return service(db).repair_formula_swap(mistaken_batch_id)
+    except CatalogError:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        raise
 
 
 # Root-level convenient paths plus explicit versioned/catalog prefixes.

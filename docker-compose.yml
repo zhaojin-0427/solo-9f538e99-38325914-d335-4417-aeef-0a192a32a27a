@@ -22,6 +22,21 @@ services:
       start_period: 5s
     restart: unless-stopped
 
+  # One-off F- number swap repair against the same persisted SQLite volume.
+  # It does not start with `docker compose up`; run it explicitly:
+  #   docker compose run --rm repair --list
+  #   docker compose run --rm repair --batch B-xxxxxxxxxxxxxxxx
+  repair:
+    profiles: ["repair"]
+    build:
+      context: .
+    image: gsb-unit-catalog:latest
+    environment:
+      DATABASE_URL: sqlite:////data/catalog.db
+    volumes:
+      - catalog-data:/data
+    entrypoint: ["python", "-I", "scripts/repair_formula_swap.py"]
+
 volumes:
   catalog-data:
     name: gsb-unit-catalog-data

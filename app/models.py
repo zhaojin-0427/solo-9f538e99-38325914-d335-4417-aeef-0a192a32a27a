@@ -145,3 +145,28 @@ class WarehouseEntry(Base):
     )
     batch_id: Mapped[str | None] = mapped_column(String(40), nullable=True, index=True)
     decided_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class FormulaRepair(Base):
+    """Ledger of historical F- number swap repairs, making repeats idempotent."""
+
+    __tablename__ = "formula_repairs"
+    __table_args__ = (
+        UniqueConstraint("mistaken_batch_id", name="uq_formula_repair_mistaken_batch"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    mistaken_batch_id: Mapped[str] = mapped_column(
+        String(40),
+        ForeignKey("batches.batch_id"),
+        unique=True,
+        index=True,
+        doc="误登记批次 ID（修复入口）",
+    )
+    repair_batch_id: Mapped[str] = mapped_column(
+        String(40), ForeignKey("batches.batch_id"), index=True
+    )
+    victim_formula_no: Mapped[int] = mapped_column(Integer, index=True, doc="被串号覆盖的业务号")
+    missing_formula_no: Mapped[int] = mapped_column(Integer, index=True, doc="应补建的业务号")
+    detail_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
